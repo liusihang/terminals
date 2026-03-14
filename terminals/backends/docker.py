@@ -148,23 +148,7 @@ class DockerBackend(Backend):
         """Read container metadata and return the instance info dict."""
         info = await container.show()
         instance_id = info["Id"]
-
-        # When using a custom Docker network, containers can reach each other
-        # by name.  Otherwise, use the published port on the Docker host.
-        if settings.network:
-            host = instance_name
-            port = 8000
-        else:
-            port_bindings = (
-                info.get("NetworkSettings", {})
-                .get("Ports", {})
-                .get("8000/tcp", [])
-            )
-            if port_bindings:
-                port = int(port_bindings[0]["HostPort"])
-            else:
-                port = 8000
-            host = settings.docker_host
+        host, port = self._resolve_connection_target(info, instance_name)
 
         return {
             "instance_id": instance_id,
@@ -173,6 +157,36 @@ class DockerBackend(Backend):
             "host": host,
             "port": port,
         }
+
+    def _resolve_connection_target(
+        self, info: dict, instance_name: str
+    ) -> tuple[str, int]:
+        if settings.network:
+            return instance_name, 8000
+
+        if settings.docker_connect_mode == "bridge":
+            bridge = (
+                info.get("NetworkSettings", {})
+                .get("Networks", {})
+                .get("bridge", {})
+            )
+            ip_addr = bridge.get("IPAddress")
+            if not ip_addr:
+                raise RuntimeError(
+                    "bridge IP unavailable for docker_connect_mode=bridge"
+                )
+            return ip_addr, 8000
+
+        port_bindings = (
+            info.get("NetworkSettings", {})
+            .get("Ports", {})
+            .get("8000/tcp", [])
+        )
+        if not port_bindings:
+            raise RuntimeError(
+                "published port unavailable for docker_connect_mode=host"
+            )
+        return settings.docker_host, int(port_bindings[0]["HostPort"])
 
     # ------------------------------------------------------------------
     # Reconciliation — rediscover running containers on startup
