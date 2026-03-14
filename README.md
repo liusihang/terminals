@@ -81,6 +81,7 @@ Environment variables prefixed with `TERMINALS_` (or `.env` file).
 | `TERMINALS_API_KEY` | *(auto)* | Bearer token for API auth |
 | `TERMINALS_OPEN_WEBUI_URL` | | Open WebUI URL for JWT auth |
 | `TERMINALS_IMAGE` | `ghcr.io/open-webui/open-terminal:latest` | Default container image |
+| `TERMINALS_DOCKER_CONNECT_MODE` | `host` | Docker connection mode: `host` uses published host ports, `bridge` uses the container bridge IP when Terminals runs inside Docker |
 | `TERMINALS_MAX_CPU` | | Hard cap on CPU |
 | `TERMINALS_MAX_MEMORY` | | Hard cap on memory |
 | `TERMINALS_MAX_STORAGE` | | Hard cap on storage |
@@ -88,6 +89,8 @@ Environment variables prefixed with `TERMINALS_` (or `.env` file).
 | `TERMINALS_KUBERNETES_STORAGE_MODE` | `per-user` | `per-user`, `shared`, `shared-rwo` |
 
 See [`config.py`](terminals/config.py) for the full list.
+
+For Docker deployments, `TERMINALS_DOCKER_CONNECT_MODE=host` keeps upstream behavior by routing through published ports on `TERMINALS_DOCKER_HOST`. Use `bridge` when the `terminals` service itself runs in Docker and provisions sibling containers through the Docker socket, so the proxy reaches those containers over the Docker bridge network instead.
 
 ## Authentication
 
