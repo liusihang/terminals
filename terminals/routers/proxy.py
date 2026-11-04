@@ -10,16 +10,16 @@ Named policy endpoints:
 """
 
 import asyncio
-import hmac
 import json
 import time
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote, urlencode
 
 import httpx
-import websockets
+from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import InvalidHandshake
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response, WebSocket
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
@@ -30,7 +30,7 @@ from terminals.utils.context import (
     normalize_context_id,
 )
 from terminals.utils.policy_specs import PolicyNotFoundError, resolve_policy_spec
-from terminals.routers.auth import validate_token, verify_api_key, verify_user_id
+from terminals.routers.auth import verify_api_key, verify_user_id
 
 router = APIRouter()
 
@@ -179,6 +179,8 @@ async def _proxy_request(
     # Remove hop-by-hop / routing headers.
     for h in ("host", "transfer-encoding", "connection", "x-user-id", CONTEXT_HEADER.lower()):
         headers.pop(h, None)
+    # Runtime session/process ownership must match the verified WS identity.
+    headers["x-user-id"] = user_id
 
     raw_content_length = request.headers.get("content-length")
     try:
@@ -514,86 +516,119 @@ async def proxy(
 
 
 # ---------------------------------------------------------------------------
-# WebSocket proxy for interactive terminal sessions
+# WebSocket proxies for terminal sessions, streams and browser capabilities
 # ---------------------------------------------------------------------------
 
 
-async def _validate_ws_auth(
-    ws: WebSocket, user_id: str
-) -> Optional[str]:
-    """Accept WebSocket and validate via first-message auth.
+def _ws_user_id(ws: WebSocket, verified_id: Optional[str]) -> str:
+    """Bind every supplied routing identity to the authenticated user."""
+    claimed = ws.query_params.getlist("user_id")
+    if ws.headers.get("x-user-id") is not None:
+        claimed.append(ws.headers["x-user-id"])
+    effective = verified_id or next((value for value in claimed if value), "")
+    if not effective:
+        raise HTTPException(400, "Missing user_id")
+    if any(value != effective for value in claimed):
+        raise HTTPException(403, "User does not match authenticated identity")
+    return effective
 
-    After connecting, the client must send a JSON text frame::
 
-        {"type": "auth", "token": "<api_key_or_jwt>"}
-
-    Returns the effective user_id on success, or ``None`` after closing
-    the socket with an appropriate error code.
-    """
+async def _validate_ws_auth(ws: WebSocket) -> Optional[str]:
+    """Accept ordinary streams and consume only their first auth frame."""
     await ws.accept()
-
-    # First-message authentication
     try:
         raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
         payload = json.loads(raw)
-        if payload.get("type") != "auth":
-            await ws.close(code=4001, reason="Expected auth message")
-            return None
+        if not isinstance(payload, dict) or payload.get("type") != "auth":
+            raise ValueError("Expected auth message")
         token = payload.get("token", "")
-    except (asyncio.TimeoutError, json.JSONDecodeError):
-        await ws.close(code=4001, reason="Auth timeout or invalid payload")
-        return None
+        if not isinstance(token, str):
+            raise ValueError("Invalid token")
+        verified_id = await verify_api_key(authorization=f"Bearer {token}")
     except Exception:
-        await ws.close(code=4001, reason="Auth failed")
+        await ws.close(code=4001, reason="Invalid auth message or credentials")
+        return None
+    try:
+        return _ws_user_id(ws, verified_id)
+    except HTTPException as exc:
+        await ws.close(code=4003 if exc.status_code == 403 else 4002, reason=exc.detail)
         return None
 
-    verified_user_id = None
-    if settings.open_webui_url:
+
+async def _validate_browser_ws_auth(ws: WebSocket) -> Optional[str]:
+    """Browser tickets are checked by WebUI; relay credentials follow HTTP auth.
+
+    Do not read a frame here: /ws starts with an application URL message, and
+    /stream and /vnc may send output before the viewer sends anything.
+    """
+    try:
+        verified_id = await verify_api_key(authorization=ws.headers.get("authorization"))
+        if not ws.headers.get("x-user-id"):
+            raise HTTPException(401, "Missing X-User-Id")
+        user_id = await verify_user_id(
+            verified_id=verified_id, x_user_id=ws.headers["x-user-id"]
+        )
+        effective = _ws_user_id(ws, verified_id or user_id)
+    except HTTPException as exc:
+        await ws.close(code=4003 if exc.status_code == 403 else 4001, reason=exc.detail)
+        return None
+    await ws.accept()
+    return effective
+
+
+def _close_code(code: Optional[int]) -> int:
+    # Reserved codes cannot be sent in a WebSocket close frame.
+    return code if code is not None and code not in (1005, 1006, 1015) else 1011
+
+
+async def _relay_websocket(ws: WebSocket, upstream) -> None:
+    async def client_to_upstream():
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                await upstream.close(code=_close_code(msg.get("code")))
+                return
+            if msg.get("bytes") is not None:
+                await upstream.send(msg["bytes"])
+            elif msg.get("text") is not None:
+                await upstream.send(msg["text"])
+
+    async def upstream_to_client():
         try:
-            verified_user_id = await validate_token(token)
-        except Exception:
-            await ws.close(code=4001, reason="Invalid token")
-            return None
-    elif settings.api_key and not hmac.compare_digest(token, settings.api_key):
-        await ws.close(code=4001, reason="Invalid API key")
-        return None
+            async for message in upstream:
+                if isinstance(message, bytes):
+                    await ws.send_bytes(message)
+                else:
+                    await ws.send_text(message)
+        finally:
+            await ws.close(code=_close_code(upstream.close_code))
 
-    if not user_id:
-        await ws.close(code=4002, reason="Missing user_id")
-        return None
-
-    if verified_user_id is not None and verified_user_id != user_id:
-        await ws.close(code=4003, reason="user_id does not match authenticated identity")
-        return None
-
-    return user_id
+    tasks = [
+        asyncio.create_task(client_to_upstream()),
+        asyncio.create_task(upstream_to_client()),
+    ]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _ws_proxy_handler(
     ws: WebSocket,
-    session_id: str,
+    path: str,
     user_id: str,
     policy_id: str = "default",
     context_id: str = DEFAULT_CONTEXT_ID,
     spec: Optional[dict] = None,
+    browser: bool = False,
 ):
-    """Core WebSocket proxy logic, shared by default and policy routes.
-
-    The connection counter is maintained here with a try/finally around the
-    whole proxy body — early returns on resolve/connect failures previously
-    skipped the decrement, inflating the counter permanently.
-    """
+    """Resolve a scoped worker and relay the explicit runtime WS path."""
     global active_ws_connections
     active_ws_connections += 1
     try:
-        await _ws_proxy(
-            ws,
-            session_id,
-            user_id,
-            policy_id=policy_id,
-            context_id=context_id,
-            spec=spec,
-        )
+        await _ws_proxy(ws, path, user_id, policy_id, context_id, spec, browser)
     finally:
         active_ws_connections -= 1
         try:
@@ -604,145 +639,143 @@ async def _ws_proxy_handler(
 
 async def _ws_proxy(
     ws: WebSocket,
-    session_id: str,
+    path: str,
     user_id: str,
-    policy_id: str = "default",
-    context_id: str = DEFAULT_CONTEXT_ID,
-    spec: Optional[dict] = None,
+    policy_id: str,
+    context_id: str,
+    spec: Optional[dict],
+    browser: bool,
 ):
     try:
         instance = await _resolve_instance(
             ws, user_id, policy_id=policy_id, context_id=context_id, spec=spec
         )
-    except Exception as e:
-        logger.error("Failed to resolve instance for WS: {}", e)
+    except Exception:
         await ws.close(code=4003, reason="Failed to resolve terminal instance")
         return
 
-    # Retry WebSocket connection — the container may still be starting.
-    max_retries = 5
-    upstream = None
-    for attempt in range(max_retries):
-        upstream_url = f"ws://{instance.host}:{instance.port}/api/terminals/{session_id}"
+    # Routing hints have been consumed locally. Preserve runtime options, including
+    # repeated query values, without allowing a query to select another worker.
+    query = urlencode([
+        (key, value) for key, value in ws.query_params.multi_items()
+        if key not in ("user_id", "context_id")
+    ])
+    for attempt in range(5):
+        headers = {
+            "X-User-Id": user_id,
+            "X-Session-Id": ws.headers.get("x-session-id", ""),
+            CONTEXT_HEADER: context_id,
+        }
+        if browser:
+            headers["Authorization"] = f"Bearer {instance.api_key}"
+            if ws.headers.get("cookie"):
+                headers["Cookie"] = ws.headers["cookie"]
+        upstream_url = f"ws://{instance.host}:{instance.port}/{path}"
+        if query:
+            upstream_url += f"?{query}"
         try:
-            upstream = await websockets.connect(
+            upstream = await ws_connect(
                 upstream_url,
+                additional_headers=headers,
                 compression="deflate" if settings.ws_compression else None,
+                max_size=16 * 1024 * 1024,
             )
             break
-        except (
-            ConnectionRefusedError,
-            OSError,
-            InvalidHandshake,
-        ) as e:
+        except (OSError, InvalidHandshake) as exc:
             ws.app.state.backend.invalidate_status(user_id, policy_id, context_id)
-            if attempt < max_retries - 1:
-                logger.debug("WS connect attempt {} to {} failed ({}), retrying...", attempt + 1, upstream_url, e)
-                await asyncio.sleep(1)
-                try:
-                    instance = await _resolve_instance(
-                        ws,
-                        user_id,
-                        policy_id=policy_id,
-                        context_id=context_id,
-                        spec=spec,
-                    )
-                except Exception as resolve_err:
-                    logger.error("WS re-resolve for user {} failed: {}", user_id, resolve_err)
-                    await ws.close(code=4003, reason="Terminal instance not reachable")
-                    return
-            else:
-                logger.error("WS connect to {} failed after {} retries: {}", upstream_url, max_retries, e)
+            if attempt == 4:
+                await ws.close(code=4003, reason="Terminal instance not reachable")
+                return
+            # Avoid logging browser capability URLs or credentials.
+            logger.debug("WS connect attempt {} failed ({})", attempt + 1, type(exc).__name__)
+            await asyncio.sleep(1)
+            try:
+                instance = await _resolve_instance(
+                    ws, user_id, policy_id=policy_id, context_id=context_id, spec=spec
+                )
+            except Exception:
                 await ws.close(code=4003, reason="Terminal instance not reachable")
                 return
 
     try:
         async with upstream:
-            await upstream.send(json.dumps({
-                "type": "auth",
-                "token": instance.api_key,
-                "chat_id": ws.headers.get("x-session-id", ""),
-            }))
+            if not browser:
+                await upstream.send(json.dumps({
+                    "type": "auth",
+                    "token": instance.api_key,
+                    "chat_id": ws.headers.get("x-session-id", ""),
+                }))
+            await _relay_websocket(ws, upstream)
+    except Exception as exc:
+        logger.debug("WebSocket relay closed ({})", type(exc).__name__)
+        try:
+            await ws.close(code=1011)
+        except Exception:
+            pass
 
-            async def _client_to_upstream():
-                try:
-                    while True:
-                        msg = await ws.receive()
-                        if msg["type"] == "websocket.disconnect":
-                            break
-                        elif "bytes" in msg and msg["bytes"]:
-                            await upstream.send(msg["bytes"])
-                        elif "text" in msg and msg["text"]:
-                            await upstream.send(msg["text"])
-                except Exception as e:
-                    logger.debug("client→upstream closed: {}", e)
 
-            async def _upstream_to_client():
-                try:
-                    async for message in upstream:
-                        if isinstance(message, bytes):
-                            await ws.send_bytes(message)
-                        else:
-                            await ws.send_text(message)
-                except Exception as e:
-                    logger.debug("upstream→client closed: {}", e)
+async def _dispatch_ws(ws: WebSocket, path: str, *, browser: bool = False):
+    user_id = await (_validate_browser_ws_auth(ws) if browser else _validate_ws_auth(ws))
+    if user_id is None:
+        return
+    policy_id = ws.path_params.get("policy_id", "default")
+    spec = None
+    try:
+        # Match the HTTP default route: no policy lookup without /p/{policy_id}.
+        if "policy_id" in ws.path_params:
+            policy_id, spec = await _resolve_policy_spec(policy_id)
+        context_id = _context_from_websocket(
+            ws, ws.query_params.get("context_id", DEFAULT_CONTEXT_ID)
+        )
+    except (HTTPException, ValueError):
+        await ws.close(code=4004, reason="Invalid policy or context")
+        return
+    await _ws_proxy_handler(ws, path, user_id, policy_id, context_id, spec, browser)
 
-            await asyncio.gather(
-                _client_to_upstream(),
-                _upstream_to_client(),
-                return_exceptions=True,
-            )
-    except Exception as e:
-        logger.error("WebSocket terminal proxy error: {}", e)
+
+@router.websocket("/events")
+@router.websocket("/p/{policy_id}/events")
+async def ws_events_proxy(ws: WebSocket):
+    await _dispatch_ws(ws, "events")
+
+
+@router.websocket("/desktop/stream")
+@router.websocket("/p/{policy_id}/desktop/stream")
+async def ws_desktop_proxy(ws: WebSocket):
+    await _dispatch_ws(ws, "desktop/stream")
+
+
+@router.websocket("/desktop/audio")
+@router.websocket("/p/{policy_id}/desktop/audio")
+async def ws_audio_proxy(ws: WebSocket):
+    await _dispatch_ws(ws, "desktop/audio")
+
+
+@router.websocket("/execute")
+@router.websocket("/p/{policy_id}/execute")
+async def ws_processes_proxy(ws: WebSocket):
+    await _dispatch_ws(ws, "execute")
+
+
+@router.websocket("/execute/{process_id}/status")
+@router.websocket("/p/{policy_id}/execute/{process_id}/status")
+async def ws_process_output_proxy(ws: WebSocket, process_id: str):
+    await _dispatch_ws(ws, f"execute/{quote(process_id, safe='')}/status")
 
 
 @router.websocket("/api/terminals/{session_id}")
-async def ws_terminal_proxy(
-    ws: WebSocket,
-    session_id: str,
-    user_id: str = Query(""),
-    context_id: str = Query(DEFAULT_CONTEXT_ID),
-):
-    """Default WebSocket terminal proxy (no policy)."""
-    effective_user = await _validate_ws_auth(ws, user_id)
-    if effective_user is None:
-        return
-    try:
-        context_id = _context_from_websocket(ws, context_id)
-    except ValueError as exc:
-        await ws.close(code=4004, reason=str(exc))
-        return
-    await _ws_proxy_handler(ws, session_id, effective_user, context_id=context_id)
-
-
 @router.websocket("/p/{policy_id}/api/terminals/{session_id}")
-async def ws_policy_terminal_proxy(
-    ws: WebSocket,
-    policy_id: str,
-    session_id: str,
-    user_id: str = Query(""),
-    context_id: str = Query(DEFAULT_CONTEXT_ID),
-):
-    """Policy-scoped WebSocket terminal proxy."""
-    effective_user = await _validate_ws_auth(ws, user_id)
-    if effective_user is None:
-        return
+async def ws_terminal_proxy(ws: WebSocket, session_id: str):
+    await _dispatch_ws(ws, f"api/terminals/{quote(session_id, safe='')}")
 
-    try:
-        _id, spec = await _resolve_policy_spec(policy_id)
-        context_id = _context_from_websocket(ws, context_id)
-    except HTTPException:
-        await ws.close(code=4004, reason=f"Policy '{policy_id}' not found")
-        return
-    except ValueError as exc:
-        await ws.close(code=4004, reason=str(exc))
-        return
 
-    await _ws_proxy_handler(
-        ws,
-        session_id,
-        effective_user,
-        policy_id=_id,
-        context_id=context_id,
-        spec=spec,
+@router.websocket("/browser/view/{sid}/{capability}/{kind}")
+@router.websocket("/p/{policy_id}/browser/view/{sid}/{capability}/{kind}")
+async def ws_browser_proxy(ws: WebSocket, sid: str, capability: str, kind: str):
+    if kind not in ("ws", "stream", "vnc"):
+        await ws.close(code=4004, reason="Unknown browser stream")
+        return
+    await _dispatch_ws(
+        ws, f"browser/view/{quote(sid, safe='')}/{quote(capability, safe='')}/{kind}",
+        browser=True,
     )
