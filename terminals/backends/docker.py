@@ -29,7 +29,7 @@ from terminals.utils.parsing import parse_cpu_nanos, parse_memory, parse_size
 log = logging.getLogger(__name__)
 
 # Container name prefix used for discovery during reconciliation.
-_CONTAINER_PREFIX = "terminals-"
+_OWNER_LABEL = "openwebui.com/instance-namespace"
 _DNS_SAFE = re.compile(r"[^a-z0-9-]")
 _QUIET_LOG_LEVELS = {"WARNING", "ERROR", "CRITICAL"}
 
@@ -53,12 +53,15 @@ class DockerBackend(Backend):
     ) -> str:
         """Build a deterministic, DNS-safe container name (≤63 chars)."""
         short = hashlib.sha256(user_id.encode()).hexdigest()[:12]
+        prefix = f"terminals-{settings.instance_namespace}-" if settings.instance_namespace else "terminals-"
         context_id = normalize_context_id(context_id)
         if policy_id == "default":
-            name = f"{_CONTAINER_PREFIX}{short}"
+            name = f"{prefix}{short}"
         else:
-            policy_slug = _DNS_SAFE.sub("-", policy_id.lower()).strip("-")[:20]
-            name = f"{_CONTAINER_PREFIX}{short}-{policy_slug}"
+            # Reserve space for namespace, user hash and optional context hash.
+            policy_limit = max(1, 63 - len(prefix) - len(short) - 1 - (13 if context_id != DEFAULT_CONTEXT_ID else 0))
+            policy_slug = _DNS_SAFE.sub("-", policy_id.lower()).strip("-")[:min(20, policy_limit)]
+            name = f"{prefix}{short}-{policy_slug}"
         if context_id != DEFAULT_CONTEXT_ID:
             name = f"{name}-{context_hash(context_id)}"
         return name
@@ -99,7 +102,7 @@ class DockerBackend(Backend):
 
         host_config: dict = {
             "Binds": [f"{host_data_dir}:/home/user"],
-            "PublishAllPorts": True,
+            "PublishAllPorts": not bool(network_name),
         }
         if self._mounts:
             host_config["Mounts"] = self._mounts
@@ -161,6 +164,8 @@ class DockerBackend(Backend):
                 CONTEXT_HASH_LABEL: context_hash(context_id),
             },
         }
+        if settings.instance_namespace:
+            config["Labels"][_OWNER_LABEL] = settings.instance_namespace
 
         log.info(
             "Provisioning container %s for user %s (policy=%s, context=%s, network=%s)",
@@ -183,6 +188,8 @@ class DockerBackend(Backend):
                     try:
                         old = await docker.containers.get(instance_name)
                         old_info = await old.show()
+                        if settings.instance_namespace and old_info.get("Config", {}).get("Labels", {}).get(_OWNER_LABEL) != settings.instance_namespace:
+                            raise RuntimeError("Refusing to adopt or remove a terminal owned by another orchestrator")
                         if old_info.get("State", {}).get("Running"):
                             for entry in old_info.get("Config", {}).get("Env", []):
                                 if entry.startswith("OPEN_TERMINAL_API_KEY="):
@@ -288,9 +295,12 @@ class DockerBackend(Backend):
         ``OPEN_TERMINAL_API_KEY`` env var.
         """
         docker = await self._get_docker()
+        owner_labels = ["app.kubernetes.io/managed-by=terminals"]
+        if settings.instance_namespace:
+            owner_labels.append(f"{_OWNER_LABEL}={settings.instance_namespace}")
         containers = await docker.containers.list(
             filters={
-                "label": ["app.kubernetes.io/managed-by=terminals"],
+                "label": owner_labels,
                 "status": ["running"],
             },
         )
@@ -301,6 +311,8 @@ class DockerBackend(Backend):
             info = await container.show()
             name = info.get("Name", "").lstrip("/")
             labels = info.get("Config", {}).get("Labels", {})
+            if settings.instance_namespace and labels.get(_OWNER_LABEL) != settings.instance_namespace:
+                continue
 
             user_id = labels.get("openwebui.com/user-id")
             policy_id = labels.get("openwebui.com/policy", "default")

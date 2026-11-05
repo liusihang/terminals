@@ -26,6 +26,7 @@ class Settings(BaseSettings):
 
     # Docker settings
     image: str = "ghcr.io/open-webui/open-terminal:latest"
+    instance_namespace: str = ""  # isolate Docker instances managed by this stack
     docker_network: str = Field(
         default="",
         validation_alias=AliasChoices("TERMINALS_DOCKER_NETWORK", "TERMINALS_NETWORK"),
