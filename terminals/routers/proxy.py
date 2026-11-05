@@ -20,6 +20,7 @@ import httpx
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import InvalidHandshake
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, WebSocket
+from starlette.background import BackgroundTask
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
@@ -305,7 +306,7 @@ async def _proxy_request(
         content=upstream_resp.aiter_bytes(),
         status_code=upstream_resp.status_code,
         headers=response_headers,
-        background=BackgroundTasks([upstream_resp.aclose]),
+        background=BackgroundTask(upstream_resp.aclose),
     )
 
 

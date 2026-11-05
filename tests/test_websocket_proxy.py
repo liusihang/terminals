@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.websockets import WebSocketDisconnect
+from starlette.requests import Request
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
@@ -390,6 +391,33 @@ class WebSocketProxyTests(unittest.TestCase):
             self.assertEqual(self.client.get(path, headers={"Authorization": "Bearer jwt-alice"}).status_code, 401)
         self.assertEqual(self.client.post("/api/v1/terminals/refresh", headers=self.headers(Authorization="Bearer jwt-alice"), json={"reset": True}).status_code, 403)
         self.assertEqual(len(self.backend.calls), before)
+
+    def test_unconsumed_upstream_stream_closes_after_response(self):
+        class UnconsumedStream(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                yield b"not-consumed"
+
+            async def aclose(self):
+                self.closed = True
+
+        async def check():
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            stream = UnconsumedStream()
+            upstream = httpx.Response(200, stream=stream)
+            request = Request({"type": "http", "method": "GET", "path": "/files/read",
+                               "query_string": b"", "headers": [], "app": self.client.app}, receive)
+            with patch.object(self.worker_client, "send", AsyncMock(return_value=upstream)):
+                response = await proxy._proxy_request(request, "alice", "files/read")
+            self.assertFalse(stream.closed)
+            await response.background()
+            self.assertTrue(stream.closed)
+            self.assertTrue(upstream.is_closed)
+
+        self.client.portal.call(check)
 
     def test_large_desktop_binary_and_client_close_code(self):
         with self.client.websocket_connect("/desktop/stream?user_id=alice", headers=self.headers()) as socket:
