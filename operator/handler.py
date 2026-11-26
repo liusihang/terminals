@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 import kopf
 import kubernetes
 from kubernetes import client as k8s
+from machines.utils.kubernetes_labels import template_label
 
 log = logging.getLogger(__name__)
 
@@ -57,14 +58,18 @@ RESTRICTED_CONTAINER_SECURITY_CONTEXT = {
 # ---------------------------------------------------------------------------
 
 
+def _setting(name: str, default: str = "") -> str:
+    return os.environ.get(f"MACHINES_{name}", os.environ.get(f"TERMINALS_{name}", default))
+
+
 def _configured_log_level() -> int:
-    raw = os.environ.get("TERMINALS_LOG_LEVEL", "INFO")
+    raw = _setting("LOG_LEVEL", "INFO")
     level = raw.strip().upper()
     if level in _LOG_LEVELS:
         return _LOG_LEVELS[level]
 
     log.warning(
-        "Invalid TERMINALS_LOG_LEVEL=%r; using INFO. Expected one of: %s",
+        "Invalid MACHINES_LOG_LEVEL=%r; using INFO. Expected one of: %s",
         raw,
         ", ".join(_LOG_LEVELS),
     )
@@ -211,6 +216,9 @@ def _apply_pod_template(pod_manifest: dict, pod_template: dict | None) -> dict:
                     {},
                 )
                 generated_container = generated_spec["containers"][0]
+                for field in ("readinessProbe", "livenessProbe"):
+                    if field in template_container:
+                        container[field] = template_container[field]
                 for field in ("env", "ports", "volumeMounts"):
                     container[field] = _merge_by_name(
                         template_container.get(field), generated_container.get(field)
@@ -269,7 +277,7 @@ def _owner_ref(body: dict) -> dict:
     }
 
 
-def _labels(name: str, user_id: str = "") -> dict[str, str]:
+def _labels(name: str, template_id: str = "") -> dict[str, str]:
     labels = {
         "app.kubernetes.io/name": "open-terminal",
         "app.kubernetes.io/instance": name,
@@ -277,8 +285,8 @@ def _labels(name: str, user_id: str = "") -> dict[str, str]:
         "app.kubernetes.io/part-of": "open-terminal",
         "openwebui.com/terminal": name,
     }
-    if user_id:
-        labels["openwebui.com/user-id"] = user_id
+    if template_id:
+        labels["openwebui.com/template"] = template_label(template_id)
     return labels
 
 
@@ -311,20 +319,20 @@ def _set_condition(
 
 
 def _parse_node_selector() -> dict[str, str] | None:
-    raw = os.environ.get("TERMINALS_KUBERNETES_NODE_SELECTOR", "").strip()
+    raw = _setting("KUBERNETES_NODE_SELECTOR").strip()
     if not raw:
         return None
     if raw.startswith("{"):
         data = json.loads(raw)
         if not isinstance(data, dict):
-            raise ValueError("TERMINALS_KUBERNETES_NODE_SELECTOR must be an object")
+            raise ValueError("MACHINES_KUBERNETES_NODE_SELECTOR must be an object")
         return {str(key): str(value) for key, value in data.items()}
 
     selector = {}
     for pair in raw.split(","):
         if "=" not in pair:
             raise ValueError(
-                "TERMINALS_KUBERNETES_NODE_SELECTOR must be JSON or k=v pairs"
+                "MACHINES_KUBERNETES_NODE_SELECTOR must be JSON or k=v pairs"
             )
         key, value = pair.split("=", 1)
         selector[key.strip()] = value.strip()
@@ -332,12 +340,12 @@ def _parse_node_selector() -> dict[str, str] | None:
 
 
 def _parse_tolerations() -> list[dict] | None:
-    raw = os.environ.get("TERMINALS_KUBERNETES_TOLERATIONS", "").strip()
+    raw = _setting("KUBERNETES_TOLERATIONS").strip()
     if not raw:
         return None
     data = json.loads(raw)
     if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
-        raise ValueError("TERMINALS_KUBERNETES_TOLERATIONS must be a JSON array")
+        raise ValueError("MACHINES_KUBERNETES_TOLERATIONS must be a JSON array")
     return data
 
 
@@ -353,9 +361,9 @@ def _build_pod_manifest(
     api_key: str,
     owner_ref: dict,
     pvc_name: str | None,
-    user_id: str = "",
+    template_id: str = "",
 ) -> dict:
-    """Build the Pod manifest for an Open Terminal instance."""
+    """Build the Pod manifest for an Open Terminal environment."""
     image = spec.get("image", "ghcr.io/open-webui/open-terminal:latest")
     resources_spec = spec.get("resources", {})
     packages = spec.get("packages", [])
@@ -404,6 +412,8 @@ def _build_pod_manifest(
             "periodSeconds": 15,
         },
     }
+    if spec.get("imagePullPolicy"):
+        container["imagePullPolicy"] = spec["imagePullPolicy"]
 
     requests = resources_spec.get("requests", {})
     limits = resources_spec.get("limits", {})
@@ -422,7 +432,7 @@ def _build_pod_manifest(
     if container_security_context:
         container["securityContext"] = container_security_context
 
-    pod_labels = _labels(name, user_id)
+    pod_labels = _labels(name, template_id)
     pod_spec = {
         "containers": [container],
         "volumes": volumes,
@@ -458,7 +468,7 @@ def _build_pod_manifest(
 
 
 def _build_service_manifest(
-    name: str, namespace: str, owner_ref: dict, user_id: str = ""
+    name: str, namespace: str, owner_ref: dict, template_id: str = ""
 ) -> dict:
     return {
         "apiVersion": "v1",
@@ -466,7 +476,7 @@ def _build_service_manifest(
         "metadata": {
             "name": _resource_name(name, "svc"),
             "namespace": namespace,
-            "labels": _labels(name, user_id),
+            "labels": _labels(name, template_id),
             "ownerReferences": [owner_ref],
         },
         "spec": {
@@ -481,7 +491,7 @@ def _build_service_manifest(
 
 def _build_secret_manifest(
     name: str, namespace: str, api_key: str, owner_ref: dict,
-    user_id: str = "",
+    template_id: str = "",
 ) -> dict:
     return {
         "apiVersion": "v1",
@@ -489,7 +499,7 @@ def _build_secret_manifest(
         "metadata": {
             "name": _resource_name(name, "apikey"),
             "namespace": namespace,
-            "labels": _labels(name, user_id),
+            "labels": _labels(name, template_id),
             "ownerReferences": [owner_ref],
         },
         "type": "Opaque",
@@ -501,7 +511,7 @@ def _build_secret_manifest(
 
 def _build_pvc_manifest(
     name: str, namespace: str, spec: dict, owner_ref: dict,
-    user_id: str = "",
+    template_id: str = "",
 ) -> dict:
     persistence = spec.get("persistence", {})
     size = persistence.get("size", "1Gi")
@@ -516,7 +526,7 @@ def _build_pvc_manifest(
         "metadata": {
             "name": _resource_name(name, "pvc"),
             "namespace": namespace,
-            "labels": _labels(name, user_id),
+            "labels": _labels(name, template_id),
         },
         "spec": {
             "accessModes": ["ReadWriteOnce"],
@@ -533,12 +543,29 @@ def _build_pvc_manifest(
 # ---------------------------------------------------------------------------
 
 
+def _raise_provisioning_error(error, patch):
+    if error.status != 403:
+        raise error
+    message = (
+        "Machine capacity exhausted, please retry later"
+        if "exceeded quota" in (error.body or "").lower()
+        else "Machine provisioning forbidden by Kubernetes"
+    )
+    log.error("Terminal resource creation rejected: %s", error)
+    patch.status["phase"] = "Error"
+    patch.status["message"] = message
+    patch.status["conditions"] = _set_condition(
+        {}, "Ready", "False", "ProvisioningFailed", message
+    )
+    raise kopf.PermanentError(message) from error
+
+
 @kopf.on.create(GROUP, VERSION, PLURAL)
 async def on_create(body, spec, name, namespace, patch, **_):
     """Create all child resources for a new Terminal CR."""
-    log.info("Creating terminal %s/%s for user %s", namespace, name, spec.get("userId"))
+    log.info("Creating machine %s/%s for template %s", namespace, name, spec.get("templateId"))
 
-    user_id = spec.get("userId", "")
+    template_id = spec.get("templateId", "")
     owner_ref = _owner_ref(body)
     api_key = _generate_api_key()
     core_v1 = k8s.CoreV1Api()
@@ -555,7 +582,7 @@ async def on_create(body, spec, name, namespace, patch, **_):
     pvc_name = None
     if persistence.get("enabled", True):
         pvc_name = _resource_name(name, "pvc")
-        pvc_manifest = _build_pvc_manifest(name, namespace, spec, owner_ref, user_id=user_id)
+        pvc_manifest = _build_pvc_manifest(name, namespace, spec, owner_ref, template_id=template_id)
         try:
             core_v1.create_namespaced_persistent_volume_claim(
                 namespace=namespace, body=pvc_manifest
@@ -565,11 +592,11 @@ async def on_create(body, spec, name, namespace, patch, **_):
             if e.status == 409:
                 log.info("PVC %s/%s already exists", namespace, pvc_name)
             else:
-                raise
+                _raise_provisioning_error(e, patch)
 
     # -- Secret (API key)
     secret_name = _resource_name(name, "apikey")
-    secret_manifest = _build_secret_manifest(name, namespace, api_key, owner_ref, user_id=user_id)
+    secret_manifest = _build_secret_manifest(name, namespace, api_key, owner_ref, template_id=template_id)
     try:
         core_v1.create_namespaced_secret(namespace=namespace, body=secret_manifest)
         log.info("Created Secret %s/%s", namespace, secret_name)
@@ -579,11 +606,11 @@ async def on_create(body, spec, name, namespace, patch, **_):
             existing = core_v1.read_namespaced_secret(secret_name, namespace)
             api_key = base64.b64decode(existing.data["api-key"]).decode()
         else:
-            raise
+            _raise_provisioning_error(e, patch)
 
     # -- Service
     svc_name = _resource_name(name, "svc")
-    svc_manifest = _build_service_manifest(name, namespace, owner_ref, user_id=user_id)
+    svc_manifest = _build_service_manifest(name, namespace, owner_ref, template_id=template_id)
     try:
         core_v1.create_namespaced_service(namespace=namespace, body=svc_manifest)
         log.info("Created Service %s/%s", namespace, svc_name)
@@ -591,12 +618,12 @@ async def on_create(body, spec, name, namespace, patch, **_):
         if e.status == 409:
             log.info("Service %s/%s already exists", namespace, svc_name)
         else:
-            raise
+            _raise_provisioning_error(e, patch)
 
     # -- Pod
     pod_name = _resource_name(name, "pod")
     pod_manifest = _build_pod_manifest(
-        name, namespace, spec, api_key, owner_ref, pvc_name, user_id=user_id
+        name, namespace, spec, api_key, owner_ref, pvc_name, template_id=template_id
     )
     try:
         core_v1.create_namespaced_pod(namespace=namespace, body=pod_manifest)
@@ -605,7 +632,7 @@ async def on_create(body, spec, name, namespace, patch, **_):
         if e.status == 409:
             log.info("Pod %s/%s already exists", namespace, pod_name)
         else:
-            raise
+            _raise_provisioning_error(e, patch)
 
     # -- Update status
     service_url = f"http://{svc_name}.{namespace}.svc:8000"
@@ -658,6 +685,9 @@ async def on_pod_event(event, body, **_):
     # Check container readiness
     container_statuses = (pod.get("status") or {}).get("containerStatuses", [])
     is_ready = any(cs.get("ready", False) for cs in container_statuses)
+    if event.get("type") == "DELETED":
+        pod_phase = "Deleted"
+        is_ready = False
 
     custom_api = k8s.CustomObjectsApi()
     try:
@@ -676,8 +706,15 @@ async def on_pod_event(event, body, **_):
     current_status = terminal.get("status", {})
     current_phase = current_status.get("phase")
 
+    # Ignore delayed events from a previous CR with the same name.
+    if any(
+        owner.get("kind") == "Terminal" and owner.get("uid") != terminal["metadata"]["uid"]
+        for owner in pod["metadata"].get("ownerReferences", [])
+    ):
+        return
+
     # Don't update if terminal is being torn down
-    if current_phase in ("Idle",):
+    if current_phase in ("Idle",) or terminal.get("metadata", {}).get("deletionTimestamp"):
         return
 
     new_phase = current_phase
@@ -685,7 +722,7 @@ async def on_pod_event(event, body, **_):
         new_phase = "Running"
     elif pod_phase in ("Pending",):
         new_phase = "Pending"
-    elif pod_phase in ("Failed", "Unknown"):
+    elif pod_phase in ("Failed", "Unknown", "Deleted"):
         new_phase = "Error"
 
     if new_phase == current_phase and current_phase == "Running" and is_ready:
@@ -741,6 +778,8 @@ async def idle_check(spec, status, name, namespace, **_):
         return
 
     timeout_minutes = spec.get("idleTimeoutMinutes", 30)
+    if timeout_minutes <= 0:
+        return
     try:
         last_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
     except (ValueError, TypeError):
