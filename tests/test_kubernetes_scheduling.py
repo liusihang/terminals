@@ -1,6 +1,6 @@
 import unittest
 
-from terminals.utils.kubernetes_scheduling import (
+from machines.utils.kubernetes_scheduling import (
     _parse_node_selector,
     _parse_tolerations,
 )
